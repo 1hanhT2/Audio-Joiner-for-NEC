@@ -1,10 +1,10 @@
-## YouTube Audio Sequencer (Streamlit + ffmpeg + yt-dlp)
+## Audio Mixer (Streamlit + ffmpeg + yt-dlp)
 
-Create a simple, consumer‑grade audio sequence from up to four YouTube links and up to four local background tracks. No overlay/mixing: each background plays independently before its corresponding YouTube audio.
+Create a simple, consumer‑grade audio sequence from up to four audio sources (YouTube URLs and/or uploaded files) and up to four local background tracks. No overlay/mixing: each background plays independently before its corresponding audio.
 
 ### What it does
-- Downloads audio tracks from the provided YouTube URLs
-- Optionally changes playback speed for each YouTube track (single slider applied to all)
+- Downloads audio tracks from YouTube URLs and/or processes uploaded audio files
+- Optionally changes playback speed for all audio tracks (single slider applied to all)
 - Builds this sequence for each i in 1..N (N ≤ 4):
   - background_i → audio_i → silence (default 5s) → audio_i
 - Concatenates all segments into one file
@@ -50,11 +50,26 @@ Only the first N that exist will be used. Each background_i plays before its cor
 streamlit run streamlit_app.py
 ```
 UI controls:
-- YouTube URLs (up to 4, one per line)
-- Speed (applies to YouTube tracks only)
+- **Input Sources**: Choose up to 4 audio sources, each can be:
+  - YouTube URL (paste a YouTube link)
+  - Upload File (upload MP3, WAV, M4A, AAC, FLAC, OGG, or OPUS files)
+  - Skip (leave this slot empty)
+- Speed (applies to all audio tracks)
 - Silence length between repeats (seconds)
 - Background volume (dB) when re-encoding backgrounds for consistency
 - Output format (MP3/WAV/M4A)
+
+### Hybrid Input Support
+You can now mix different input types:
+- Use all YouTube URLs
+- Use all uploaded files
+- Mix YouTube URLs with uploaded files
+- Skip slots you don't need
+
+Example combinations:
+- Slot 1: YouTube URL, Slot 2: Upload File, Slot 3: Skip, Slot 4: YouTube URL
+- All 4 slots: Upload Files
+- All 4 slots: YouTube URLs (original behavior)
 
 ### Run via CLI
 ```bash
@@ -72,9 +87,11 @@ Flags:
 - `--out` – output file; extension controls encoder (.mp3/.wav/.m4a)
 
 ### Notes & tips
-- If you provide fewer than 4 URLs, only the available background files are used (1..N)
+- If you provide fewer than 4 audio sources, only the available background files are used (1..N)
 - Background segments are re-encoded to PCM WAV to ensure safe concatenation
+- Uploaded files are automatically converted to PCM WAV format for processing
 - To reduce size further, export MP3 at 128 kbps by changing the encoder settings in `yt_audio_mix.py`
+- Supported upload formats: MP3, WAV, M4A, AAC, FLAC, OGG, OPUS
 
 ### Troubleshooting
 - "Missing required tool(s)": Ensure `ffmpeg` and `yt-dlp` are installed and on PATH

@@ -61,6 +61,20 @@ def _validate_and_clean_urls(raw_text: str) -> List[str]:
     return urls[:4]
 
 
+def _validate_uploaded_files(uploaded_files: List) -> List:
+    """Validate uploaded audio files and return valid ones."""
+    valid_files = []
+    for file in uploaded_files:
+        if file is not None:
+            # Check file extension
+            file_ext = Path(file.name).suffix.lower()
+            if file_ext in ['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.opus']:
+                valid_files.append(file)
+            else:
+                st.warning(f"Unsupported file format: {file.name}. Supported formats: mp3, wav, m4a, aac, flac, ogg, opus")
+    return valid_files[:4]  # Limit to 4 files
+
+
 def _write_uploaded_file_to_temp(uploaded_file) -> Path:
     suffix = Path(uploaded_file.name).suffix or ".bin"
     tmp_dir = Path(tempfile.mkdtemp(prefix="yt_audio_mix_music_"))
@@ -72,6 +86,7 @@ def _write_uploaded_file_to_temp(uploaded_file) -> Path:
 
 def _run_pipeline(
     urls: List[str],
+    uploaded_files: List,
     speed: float,
     silence_seconds: float,
     bg_volume_db: float,
@@ -154,6 +169,12 @@ def _run_pipeline(
 def _init_session_state():
     if "logs" not in st.session_state:
         st.session_state["logs"] = ""
+    if "output_data" not in st.session_state:
+        st.session_state["output_data"] = None
+    if "output_filename" not in st.session_state:
+        st.session_state["output_filename"] = None
+    if "output_mime" not in st.session_state:
+        st.session_state["output_mime"] = None
 
 
 def _append_log(line: str, log_area):
@@ -162,11 +183,11 @@ def _append_log(line: str, log_area):
 
 
 def main():
-    st.set_page_config(page_title="YouTube Audio Mixer", page_icon="🎵", layout="centered")
+    st.set_page_config(page_title="Audio Mixer", page_icon="🎵", layout="centered")
     _init_session_state()
 
-    st.title("🎵 YouTube Audio Mixer")
-    st.caption("Download audio tracks, stitch with a music intro, and export with ffmpeg.")
+    st.title("🎵 Audio Mixer")
+    st.caption("Mix YouTube audio tracks and/or uploaded files with background music.")
 
     with st.expander("Requirements", expanded=False):
         st.markdown(
@@ -174,15 +195,60 @@ def main():
             "- Install Python deps: `pip install streamlit yt-dlp`"
         )
 
-    urls_text = st.text_area(
-        "YouTube URLs (one per line, up to 4)",
-        height=100,
-        placeholder="https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/watch?v=...",
-    )
+    # Input Sources Section
+    st.header("🎤 Input Sources")
+    st.caption("Choose up to 4 audio sources. Mix YouTube URLs and uploaded files as needed.")
+    
+    # Initialize session state for input types
+    if "input_types" not in st.session_state:
+        st.session_state["input_types"] = ["YouTube URL"] * 4
+    
+    # Create input slots
+    urls = []
+    uploaded_files = []
+    
+    for i in range(4):
+        with st.expander(f"Audio Source {i+1}", expanded=(i == 0)):
+            col1, col2 = st.columns([1, 2])
+            
+            with col1:
+                input_type = st.selectbox(
+                    f"Input Type {i+1}",
+                    options=["YouTube URL", "Upload File", "Skip"],
+                    index=["YouTube URL", "Upload File", "Skip"].index(st.session_state["input_types"][i]),
+                    key=f"input_type_{i}"
+                )
+                st.session_state["input_types"][i] = input_type
+            
+            with col2:
+                if input_type == "YouTube URL":
+                    url = st.text_input(
+                        f"YouTube URL {i+1}",
+                        placeholder="https://www.youtube.com/watch?v=...",
+                        key=f"url_{i}"
+                    )
+                    if url.strip():
+                        urls.append(url.strip())
+                    else:
+                        urls.append("")
+                        
+                elif input_type == "Upload File":
+                    uploaded_file = st.file_uploader(
+                        f"Upload Audio File {i+1}",
+                        type=['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'],
+                        key=f"file_{i}"
+                    )
+                    uploaded_files.append(uploaded_file)
+                else:  # Skip
+                    st.info("This slot will be skipped")
+                    uploaded_files.append(None)
 
+    # Processing Options
+    st.header("⚙️ Processing Options")
+    
     col1, col2 = st.columns(2)
     with col1:
-        speed = st.slider("Speed (applies to YT tracks)", min_value=0.25, max_value=4.0, value=1.0, step=0.05)
+        speed = st.slider("Speed (applies to all audio tracks)", min_value=0.25, max_value=4.0, value=1.0, step=0.05)
     with col2:
         silence_seconds = st.slider("Silence between repeats (s)", min_value=1.0, max_value=15.0, value=5.0, step=0.5)
 
@@ -203,9 +269,12 @@ def main():
         st.session_state["logs"] = ""
         log_area.code(st.session_state["logs"], language="bash")
 
-        urls = _validate_and_clean_urls(urls_text)
-        if not urls:
-            st.error("Please provide at least one YouTube URL.")
+        # Validate inputs
+        valid_urls = [url for url in urls if url.strip()]
+        valid_files = [f for f in uploaded_files if f is not None]
+        
+        if not valid_urls and not valid_files:
+            st.error("Please provide at least one audio source (YouTube URL or uploaded file).")
             return
 
         try:
@@ -215,6 +284,7 @@ def main():
             with st.spinner("Processing..."):
                 out_file, work_dir = _run_pipeline(
                     urls=urls,
+                    uploaded_files=uploaded_files,
                     speed=float(speed),
                     silence_seconds=float(silence_seconds),
                     bg_volume_db=float(bg_volume_db),
@@ -225,15 +295,39 @@ def main():
 
             st.success("Done")
             data = out_file.read_bytes()
-            st.download_button(
-                label="Download mixed audio",
-                data=data,
-                file_name=f"mixed_audio{output_ext}",
-                mime="audio/wav" if output_ext == ".wav" else ("audio/mpeg" if output_ext == ".mp3" else "audio/mp4"),
-            )
+            
+            # Store output data in session state for persistent download
+            st.session_state["output_data"] = data
+            st.session_state["output_filename"] = f"mixed_audio{output_ext}"
+            st.session_state["output_mime"] = "audio/wav" if output_ext == ".wav" else ("audio/mpeg" if output_ext == ".mp3" else "audio/mp4")
+            
             st.caption(f"Working directory: {work_dir}")
         except Exception as e:
             st.error(f"Error: {e}")
+
+    # Persistent Download Section
+    if st.session_state["output_data"] is not None:
+        st.header("📥 Download Your Audio")
+        st.success("✅ Your mixed audio is ready for download!")
+        
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.download_button(
+                label="📥 Download Mixed Audio",
+                data=st.session_state["output_data"],
+                file_name=st.session_state["output_filename"],
+                mime=st.session_state["output_mime"],
+                type="primary",
+                use_container_width=True
+            )
+        with col2:
+            if st.button("🗑️ Clear Output", help="Clear the current output to start fresh"):
+                st.session_state["output_data"] = None
+                st.session_state["output_filename"] = None
+                st.session_state["output_mime"] = None
+                st.rerun()
+        
+        st.caption("💡 Tip: You can download this file multiple times. Click 'Clear Output' when you're done.")
 
 
 if __name__ == "__main__":
