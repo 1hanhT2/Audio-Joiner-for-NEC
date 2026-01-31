@@ -79,15 +79,18 @@ def tempo_adjust(in_wav: Path, out_wav: Path, speed: float):
          "-filter:a", ",".join(filters),
          "-ar", SAMPLE_RATE, "-ac", "2", "-c:a", "pcm_s16le", str(out_wav)])
 
-def reencode_to_pcm(in_path: Path, out_wav: Path) -> None:
-    """Re-encode any audio to 44.1kHz 16-bit stereo PCM WAV."""
-    run([
+def reencode_to_pcm(in_path: Path, out_wav: Path, volume_db: float = 0.0) -> None:
+    """Re-encode any audio to 44.1kHz 16-bit stereo PCM WAV with optional volume adjustment."""
+    cmd = [
         FFMPEG,
         "-y",
         "-i", str(in_path),
-        "-ar", SAMPLE_RATE, "-ac", "2", "-c:a", "pcm_s16le",
-        str(out_wav),
-    ])
+    ]
+    # Apply volume adjustment if specified
+    if volume_db != 0.0:
+        cmd += ["-af", f"volume={volume_db}dB"]
+    cmd += ["-ar", SAMPLE_RATE, "-ac", "2", "-c:a", "pcm_s16le", str(out_wav)]
+    run(cmd)
 
 def build_concat_list(order_paths, list_file: Path):
     with list_file.open("w", encoding="utf-8") as f:
@@ -175,7 +178,7 @@ def main():
             bg_idx = min(idx, len(background_paths)) - 1
             bg_src = background_paths[bg_idx]
             bg_pcm = work / f"background_{idx}.wav"
-            reencode_to_pcm(bg_src, bg_pcm)
+            reencode_to_pcm(bg_src, bg_pcm, args.bg_volume_db)
 
             order.append(bg_pcm)
             order.append(track)
@@ -188,11 +191,11 @@ def main():
         concat_with_ffmpeg(list_file, out_path)
 
         print(f"\n✅ Done. Output: {out_path}")
-        if not args.keep_work:
+        if args.keep_work:
             print(f"(Working files kept at: {work})")
     except Exception as e:
         print(f"Error: {e}")
-        if not args.keep_work:
+        if args.keep_work:
             print(f"Leaving work dir for inspection: {work}")
         sys.exit(1)
 

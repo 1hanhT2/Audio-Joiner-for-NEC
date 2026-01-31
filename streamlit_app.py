@@ -13,8 +13,9 @@ function to stream logs into the UI.
 
 from __future__ import annotations
 
-import io
+import atexit
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -55,10 +56,21 @@ def _make_ui_runner(log_callback: Callable[[str], None]) -> Callable[..., str]:
     return run_ui
 
 
+def _is_valid_youtube_url(url: str) -> bool:
+    """Check if URL is a valid YouTube URL."""
+    patterns = [
+        r'^https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+',
+        r'^https?://(?:www\.)?youtube\.com/shorts/[\w-]+',
+    ]
+    return any(re.match(p, url, re.IGNORECASE) for p in patterns)
+
+
 def _validate_and_clean_urls(raw_text: str) -> List[str]:
+    """Validate and clean URL inputs, filtering out invalid URLs."""
     lines = [l.strip() for l in (raw_text or "").splitlines()]
     urls = [l for l in lines if l and l not in {"/", "\\", "|"}]
-    return urls[:4]
+    # Return only valid YouTube URLs
+    return [u for u in urls if _is_valid_youtube_url(u)][:4]
 
 
 def _validate_uploaded_files(uploaded_files: List) -> List:
@@ -76,12 +88,22 @@ def _validate_uploaded_files(uploaded_files: List) -> List:
 
 
 def _write_uploaded_file_to_temp(uploaded_file) -> Path:
+    """Save uploaded file to temp directory and convert to PCM WAV."""
     suffix = Path(uploaded_file.name).suffix or ".bin"
     tmp_dir = Path(tempfile.mkdtemp(prefix="yt_audio_mix_music_"))
     tmp_path = tmp_dir / f"music_input{suffix}"
     with tmp_path.open("wb") as f:
         f.write(uploaded_file.getbuffer())
-    return tmp_path
+    
+    # Convert to PCM WAV for processing
+    wav_path = tmp_dir / "music_input.wav"
+    ym.reencode_to_pcm(tmp_path, wav_path)
+    
+    # Remove original to save space
+    if tmp_path != wav_path:
+        tmp_path.unlink()
+    
+    return wav_path
 
 
 def _run_pipeline(
@@ -93,6 +115,7 @@ def _run_pipeline(
     bg_dir: Path,
     output_ext: str,
     log_callback: Callable[[str], None],
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> Tuple[Path, Path]:
     """Execute the mixing pipeline using functions from yt_audio_mix.
 
@@ -107,31 +130,61 @@ def _run_pipeline(
     ym.require_tools()
 
     work = Path(tempfile.mkdtemp(prefix="yt_audio_mix_ui_")).resolve()
+    # Register cleanup to remove temp directory on exit
+    atexit.register(lambda: shutil.rmtree(work, ignore_errors=True))
+    
     output_path = work / f"final_output{output_ext}"
 
     log_callback(f"Working directory: {work}")
 
-    # Prepare silence segment according to user choice
+    # Calculate total steps for progress tracking
+    valid_urls = [u for u in urls if u.strip()]
+    valid_files = [f for f in uploaded_files if f is not None]
+    total_tracks = len(valid_urls) + len(valid_files)
+    
+    if total_tracks == 0:
+        raise ValueError("No valid audio sources provided")
+
+    # Step 1: Prepare silence segment
+    if progress_callback:
+        progress_callback(1, "Preparing silence segment...")
     silenceN = work / "silence.wav"
     ym.make_silence(silence_seconds, silenceN)
 
-    # Download and normalize
+    # Step 2: Download YouTube audio
     fixed_tracks: List[Path] = []
-    for i, url in enumerate(urls, start=1):
-        fixed = ym.download_audio(url, f"video{i}", work)
-        fixed_tracks.append(fixed)
+    if valid_urls:
+        if progress_callback:
+            progress_callback(2, f"Downloading {len(valid_urls)} YouTube audio(s)...")
+        for i, url in enumerate(valid_urls, start=1):
+            log_callback(f"Downloading video {i}/{len(valid_urls)}...")
+            fixed = ym.download_audio(url, f"video{i}", work)
+            fixed_tracks.append(fixed)
 
-    # Tempo-adjust videos only
+    # Step 3: Process uploaded files
+    if valid_files:
+        if progress_callback:
+            progress_callback(3, f"Processing {len(valid_files)} uploaded file(s)...")
+        for i, uploaded_file in enumerate(valid_files, start=len(fixed_tracks)+1):
+            log_callback(f"Processing uploaded file {i-len(fixed_tracks)}/{len(valid_files)}: {uploaded_file.name}")
+            tmp_path = _write_uploaded_file_to_temp(uploaded_file)
+            fixed_tracks.append(tmp_path)
+
+    # Step 4: Tempo-adjust all tracks
+    if progress_callback:
+        progress_callback(4, "Adjusting playback speed...")
     if abs(speed - 1.0) > 1e-9:
         sped_tracks: List[Path] = []
         for i, t in enumerate(fixed_tracks, start=1):
-            out = work / f"video{i}_x{speed}.wav"
+            out = work / f"audio{i}_x{speed}.wav"
             ym.tempo_adjust(t, out, speed)
             sped_tracks.append(out)
     else:
         sped_tracks = fixed_tracks
 
-    # Resolve background files
+    # Step 5: Resolve background files
+    if progress_callback:
+        progress_callback(5, "Processing background tracks...")
     bg_paths: List[Path] = []
     for i in range(1, 5):
         base = f"background_audiofile_{i:02d}"
@@ -144,21 +197,30 @@ def _run_pipeline(
         if found:
             bg_paths.append(found)
 
-    # Build order per diagram: for each i -> background_i, audio_i, silence, audio_i
+    if len(bg_paths) == 0:
+        raise ValueError("No background audio files found. Please add background_audiofile_01.mp3 (etc.) to the project folder.")
+
+    # Step 6: Build concatenation order
+    if progress_callback:
+        progress_callback(6, "Building audio sequence...")
     order: List[Path] = []
     for idx, t in enumerate(sped_tracks, start=1):
         bg_idx = min(idx, len(bg_paths)) - 1
+        if bg_idx < 0:
+            continue
         bg = bg_paths[bg_idx]
-        # Ensure background is PCM WAV for concat safety
+        # Ensure background is PCM WAV for concat safety, with volume adjustment
         bg_pcm = work / f"background_{idx}.wav"
-        ym.reencode_to_pcm(bg, bg_pcm)
+        ym.reencode_to_pcm(bg, bg_pcm, bg_volume_db)
 
         order.append(bg_pcm)
         order.append(t)
         order.append(silenceN)
         order.append(t)
 
-    # Concat
+    # Step 7: Final concatenation
+    if progress_callback:
+        progress_callback(7, "Finalizing audio file...")
     list_file = work / "concat_list.txt"
     ym.build_concat_list(order, list_file)
     ym.concat_with_ffmpeg(list_file, output_path)
@@ -180,6 +242,12 @@ def _init_session_state():
 def _append_log(line: str, log_area):
     st.session_state["logs"] += (line + "\n")
     log_area.code(st.session_state["logs"], language="bash")
+
+
+def _update_progress(progress_bar, step: int, message: str, total_steps: int = 7):
+    """Update progress bar with current step."""
+    progress = step / total_steps
+    progress_bar.progress(progress, text=f"Step {step}/{total_steps}: {message}")
 
 
 def main():
@@ -206,6 +274,7 @@ def main():
     # Create input slots
     urls = []
     uploaded_files = []
+    url_validation_errors = []
     
     for i in range(4):
         with st.expander(f"Audio Source {i+1}", expanded=(i == 0)):
@@ -228,7 +297,12 @@ def main():
                         key=f"url_{i}"
                     )
                     if url.strip():
-                        urls.append(url.strip())
+                        if _is_valid_youtube_url(url.strip()):
+                            urls.append(url.strip())
+                        else:
+                            urls.append("")
+                            url_validation_errors.append(f"Slot {i+1}: Invalid YouTube URL format")
+                            st.warning("⚠️ Invalid YouTube URL format")
                     else:
                         urls.append("")
                         
@@ -238,9 +312,18 @@ def main():
                         type=['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'],
                         key=f"file_{i}"
                     )
-                    uploaded_files.append(uploaded_file)
+                    # Check file size (limit to 100MB)
+                    if uploaded_file is not None:
+                        if uploaded_file.size > 100 * 1024 * 1024:
+                            st.error(f"File too large: {uploaded_file.name} ({uploaded_file.size / 1024 / 1024:.1f}MB). Max size: 100MB")
+                            uploaded_files.append(None)
+                        else:
+                            uploaded_files.append(uploaded_file)
+                    else:
+                        uploaded_files.append(None)
                 else:  # Skip
                     st.info("This slot will be skipped")
+                    urls.append("")
                     uploaded_files.append(None)
 
     # Processing Options
@@ -254,7 +337,8 @@ def main():
 
     col3, col4 = st.columns(2)
     with col3:
-        bg_volume_db = st.slider("Background volume (dB)", min_value=-40, max_value=0, value=-6, step=1)
+        bg_volume_db = st.slider("Background volume (dB)", min_value=-40, max_value=6, value=-6, step=1, 
+                                  help="Adjust background audio volume. Negative values make it quieter, positive values make it louder.")
     with col4:
         output_ext = st.selectbox("Output format", options=[".mp3", ".wav", ".m4a"], index=0)
 
@@ -276,24 +360,36 @@ def main():
         if not valid_urls and not valid_files:
             st.error("Please provide at least one audio source (YouTube URL or uploaded file).")
             return
+        
+        if url_validation_errors:
+            for err in url_validation_errors:
+                st.error(err)
+            return
 
+        # Progress tracking
+        progress_bar = st.progress(0, text="Starting...")
+        
         try:
             def cb(line: str):
                 _append_log(line, log_area)
+            
+            def progress_cb(step: int, message: str):
+                _update_progress(progress_bar, step, message)
 
-            with st.spinner("Processing..."):
-                out_file, work_dir = _run_pipeline(
-                    urls=urls,
-                    uploaded_files=uploaded_files,
-                    speed=float(speed),
-                    silence_seconds=float(silence_seconds),
-                    bg_volume_db=float(bg_volume_db),
-                    bg_dir=bg_dir,
-                    output_ext=str(output_ext),
-                    log_callback=cb,
-                )
+            out_file, work_dir = _run_pipeline(
+                urls=urls,
+                uploaded_files=uploaded_files,
+                speed=float(speed),
+                silence_seconds=float(silence_seconds),
+                bg_volume_db=float(bg_volume_db),
+                bg_dir=bg_dir,
+                output_ext=str(output_ext),
+                log_callback=cb,
+                progress_callback=progress_cb,
+            )
 
-            st.success("Done")
+            progress_bar.empty()  # Remove progress bar on success
+            st.success("✅ Audio mixing completed successfully!")
             data = out_file.read_bytes()
             
             # Store output data in session state for persistent download
@@ -303,7 +399,8 @@ def main():
             
             st.caption(f"Working directory: {work_dir}")
         except Exception as e:
-            st.error(f"Error: {e}")
+            progress_bar.empty()
+            st.error(f"❌ Error: {e}")
 
     # Persistent Download Section
     if st.session_state["output_data"] is not None:
